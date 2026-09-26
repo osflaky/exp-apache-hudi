@@ -1,0 +1,737 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.hudi.common.util.collection;
+
+import org.apache.hudi.common.serialization.CustomSerializer;
+import org.apache.hudi.common.serialization.DefaultSerializer;
+import org.apache.hudi.common.util.HoodieTimer;
+import org.apache.hudi.common.util.SerializationUtils;
+import org.apache.hudi.common.util.StringUtils;
+import org.apache.hudi.common.util.ValidationUtils;
+import org.apache.hudi.exception.HoodieException;
+import org.apache.hudi.exception.HoodieIOException;
+import org.apache.hudi.io.util.FileIOUtils;
+
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import org.rocksdb.AbstractImmutableNativeReference;
+import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.DBOptions;
+import org.rocksdb.InfoLogLevel;
+import org.rocksdb.Options;
+import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.RocksIterator;
+import org.rocksdb.Statistics;
+import org.rocksdb.TickerType;
+import org.rocksdb.WriteBatch;
+import org.rocksdb.WriteOptions;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.Serializable;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static org.apache.hudi.common.util.StringUtils.fromUTF8Bytes;
+import static org.apache.hudi.common.util.StringUtils.getUTF8Bytes;
+
+/**
+ * Data access objects for storing and retrieving objects in Rocks DB.
+ */
+@Slf4j
+public class RocksDBDAO {
+
+  private transient ConcurrentHashMap<String, ColumnFamilyHandle> managedHandlesMap;
+  private transient ConcurrentHashMap<String, ColumnFamilyDescriptor> managedDescriptorMap;
+  @Getter(AccessLevel.PACKAGE)
+  private transient RocksDB rocksDB;
+  private boolean closed = false;
+  @Getter(AccessLevel.PACKAGE)
+  private final String rocksDBBasePath;
+  private final transient ConcurrentHashMap<String, CustomSerializer<?>> columnFamilySerializers;
+  private transient WriteOptions defaultWriteOptions;
+  private transient Statistics statistics;
+  @Getter(AccessLevel.PACKAGE)
+  private transient DBOptions dbOptions;
+  @Getter(AccessLevel.PACKAGE)
+  private transient org.rocksdb.Logger logger;
+  private final boolean disableWALForWrites;
+  @Getter
+  private long totalBytesWritten;
+
+  public RocksDBDAO(String basePath, String rocksDBBasePath) {
+    this(basePath, rocksDBBasePath, new ConcurrentHashMap<>(), false);
+  }
+
+  public RocksDBDAO(String basePath,
+                    String rocksDBBasePath,
+                    ConcurrentHashMap<String, CustomSerializer<?>> columnFamilySerializers) {
+    this(basePath, rocksDBBasePath, columnFamilySerializers, false);
+  }
+
+  public RocksDBDAO(String basePath,
+                    String rocksDBBasePath,
+                    ConcurrentHashMap<String, CustomSerializer<?>> columnFamilySerializers,
+                    boolean disableWAL) {
+    this.rocksDBBasePath =
+        String.format("%s/%s/%s", rocksDBBasePath, URI.create(basePath).getPath().replace(":","").replace("/", "_"), UUID.randomUUID());
+    this.columnFamilySerializers = columnFamilySerializers;
+    this.disableWALForWrites = disableWAL;
+    init();
+    totalBytesWritten = 0L;
+  }
+
+  /**
+   * Initialized Rocks DB instance.
+   */
+  private void init() {
+    try {
+      log.info("DELETING RocksDB persisted at {}", rocksDBBasePath);
+      FileIOUtils.deleteDirectory(new File(rocksDBBasePath));
+
+      managedHandlesMap = new ConcurrentHashMap<>();
+      managedDescriptorMap = new ConcurrentHashMap<>();
+
+      // If already present, loads the existing column-family handles
+      this.dbOptions = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true)
+          .setWalDir(rocksDBBasePath).setStatsDumpPeriodSec(300);
+      this.statistics = new Statistics();
+      dbOptions.setStatistics(statistics);
+      this.logger = new RocksDBLogger(dbOptions);
+      dbOptions.setLogger(logger);
+      final List<ColumnFamilyDescriptor> managedColumnFamilies = loadManagedColumnFamilies(dbOptions);
+      final List<ColumnFamilyHandle> managedHandles = new ArrayList<>(managedColumnFamilies.size());
+      FileIOUtils.mkdir(new File(rocksDBBasePath));
+      rocksDB = RocksDB.open(dbOptions, rocksDBBasePath, managedColumnFamilies, managedHandles);
+      defaultWriteOptions = new WriteOptions().setDisableWAL(disableWALForWrites);
+
+      registerColumnFamilies(managedColumnFamilies, managedHandles);
+    } catch (RocksDBException | IOException re) {
+      log.error("Got exception opening Rocks DB instance ", re);
+      closeOnInitFailure();
+      throw new HoodieException(re);
+    } catch (RuntimeException re) {
+      // The validation in registerColumnFamilies runs after RocksDB.open(), so this path can have
+      // an open DB to release as well.
+      closeOnInitFailure();
+      throw re;
+    }
+  }
+
+  /**
+   * Validates the handles RocksDB returned against the descriptors asked for, and registers them.
+   */
+  void registerColumnFamilies(List<ColumnFamilyDescriptor> managedColumnFamilies,
+                              List<ColumnFamilyHandle> managedHandles) throws RocksDBException {
+    ValidationUtils.checkArgument(managedHandles.size() == managedColumnFamilies.size(),
+        "Unexpected number of handles are returned");
+    for (int index = 0; index < managedHandles.size(); index++) {
+      ColumnFamilyHandle handle = managedHandles.get(index);
+      ColumnFamilyDescriptor descriptor = managedColumnFamilies.get(index);
+      String familyNameFromHandle = fromUTF8Bytes(handle.getName());
+      String familyNameFromDescriptor = fromUTF8Bytes(descriptor.getName());
+
+      ValidationUtils.checkArgument(familyNameFromDescriptor.equals(familyNameFromHandle),
+          "Family Handles not in order with descriptors");
+      managedHandlesMap.put(familyNameFromHandle, handle);
+      managedDescriptorMap.put(familyNameFromDescriptor, descriptor);
+    }
+  }
+
+  /**
+   * init() runs from the constructor, so a throw leaves no reference for any caller to close():
+   * everything opened so far has to be released here or it outlives the failed DAO.
+   */
+  private void closeOnInitFailure() {
+    if (managedHandlesMap != null) {
+      managedHandlesMap.values().forEach(AbstractImmutableNativeReference::close);
+      managedHandlesMap.clear();
+    }
+    closeColumnFamilyDescriptors();
+    if (defaultWriteOptions != null) {
+      defaultWriteOptions.close();
+      defaultWriteOptions = null;
+    }
+    if (rocksDB != null) {
+      rocksDB.close();
+      rocksDB = null;
+    }
+    closeNativeOptions();
+  }
+
+  /**
+   * Helper to load managed column family descriptors.
+   */
+  List<ColumnFamilyDescriptor> loadManagedColumnFamilies(DBOptions dbOptions) throws RocksDBException {
+    final List<ColumnFamilyDescriptor> managedColumnFamilies = new ArrayList<>();
+    // The native Options copy-constructs from dbOptions, which copies its shared_ptr to the
+    // LoggerJniCallback. Leaving it open holds that refcount above zero for the life of the JVM,
+    // so closing the DB, the DBOptions and the Logger still never deletes the callback's JNI
+    // global reference to the Java Logger.
+    try (ColumnFamilyOptions columnFamilyOptions = new ColumnFamilyOptions();
+         Options options = new Options(dbOptions, columnFamilyOptions)) {
+      List<byte[]> existing = RocksDB.listColumnFamilies(options, rocksDBBasePath);
+
+      if (existing.isEmpty()) {
+        log.info("No column family found. Loading default");
+        managedColumnFamilies.add(getColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY));
+      } else {
+        log.info("Loading column families: {}", existing.stream().map(String::new).collect(Collectors.toList()));
+        managedColumnFamilies
+            .addAll(existing.stream().map(RocksDBDAO::getColumnFamilyDescriptor).collect(Collectors.toList()));
+      }
+    }
+    return managedColumnFamilies;
+  }
+
+  private static ColumnFamilyDescriptor getColumnFamilyDescriptor(byte[] columnFamilyName) {
+    return new ColumnFamilyDescriptor(columnFamilyName, new ColumnFamilyOptions());
+  }
+
+  /**
+   * Perform a batch write operation.
+   */
+  public void writeBatch(BatchHandler handler) {
+    try (WriteBatch batch = new WriteBatch()) {
+      handler.apply(batch);
+      getRocksDB().write(defaultWriteOptions, batch);
+    } catch (RocksDBException re) {
+      throw new HoodieException(re);
+    }
+  }
+
+  /**
+   * Helper to add put operation in batch.
+   *
+   * @param batch Batch Handle
+   * @param columnFamilyName Column Family
+   * @param key Key
+   * @param value Payload
+   * @param <T> Type of payload
+   */
+  public <T extends Serializable> void putInBatch(WriteBatch batch, String columnFamilyName, String key, T value) {
+    try {
+      byte[] payload = serializePayload(columnFamilyName, value);
+      batch.put(managedHandlesMap.get(columnFamilyName), getUTF8Bytes(key), payload);
+    } catch (Exception e) {
+      throw new HoodieException(e);
+    }
+  }
+
+  /**
+   * Helper to add put operation in batch.
+   *
+   * @param batch Batch Handle
+   * @param columnFamilyName Column Family
+   * @param key Key
+   * @param value Payload
+   * @param <T> Type of payload
+   */
+  public <K extends Serializable, T> void putInBatch(WriteBatch batch, String columnFamilyName,
+      K key, T value) {
+    try {
+      byte[] keyBytes = SerializationUtils.serialize(key);
+      byte[] payload = serializePayload(columnFamilyName, value);
+      batch.put(managedHandlesMap.get(columnFamilyName), keyBytes, payload);
+    } catch (Exception e) {
+      throw new HoodieException(e);
+    }
+  }
+
+  /**
+   * Perform single PUT on a column-family.
+   *
+   * @param columnFamilyName Column family name
+   * @param key Key
+   * @param value Payload
+   * @param <T> Type of Payload
+   */
+  public <T extends Serializable> void put(String columnFamilyName, String key, T value) {
+    try {
+      byte[] payload = serializePayload(columnFamilyName, value);
+      getRocksDB().put(managedHandlesMap.get(columnFamilyName), defaultWriteOptions, getUTF8Bytes(key), payload);
+    } catch (Exception e) {
+      throw new HoodieException(e);
+    }
+  }
+
+  /**
+   * Perform single PUT on a column-family.
+   *
+   * @param columnFamilyName Column family name
+   * @param key Key
+   * @param value Payload
+   * @param <T> Type of Payload
+   */
+  public <K extends Serializable, T> void put(String columnFamilyName, K key, T value) {
+    try {
+      byte[] payload = serializePayload(columnFamilyName, value);
+      getRocksDB().put(managedHandlesMap.get(columnFamilyName), defaultWriteOptions, SerializationUtils.serialize(key), payload);
+    } catch (Exception e) {
+      throw new HoodieException(e);
+    }
+  }
+
+  /**
+   * Helper to add delete operation in batch.
+   *
+   * @param batch Batch Handle
+   * @param columnFamilyName Column Family
+   * @param key Key
+   */
+  public void deleteInBatch(WriteBatch batch, String columnFamilyName, String key) {
+    try {
+      batch.delete(managedHandlesMap.get(columnFamilyName), getUTF8Bytes(key));
+    } catch (RocksDBException e) {
+      throw new HoodieException(e);
+    }
+  }
+
+  /**
+   * Helper to add delete operation in batch.
+   *
+   * @param batch Batch Handle
+   * @param columnFamilyName Column Family
+   * @param key Key
+   */
+  public <K extends Serializable> void deleteInBatch(WriteBatch batch, String columnFamilyName, K key) {
+    try {
+      batch.delete(managedHandlesMap.get(columnFamilyName), SerializationUtils.serialize(key));
+    } catch (Exception e) {
+      throw new HoodieException(e);
+    }
+  }
+
+  /**
+   * Perform a single Delete operation.
+   *
+   * @param columnFamilyName Column Family name
+   * @param key Key to be deleted
+   */
+  public void delete(String columnFamilyName, String key) {
+    try {
+      getRocksDB().delete(managedHandlesMap.get(columnFamilyName), defaultWriteOptions, getUTF8Bytes(key));
+    } catch (RocksDBException e) {
+      throw new HoodieException(e);
+    }
+  }
+
+  /**
+   * Perform a single Delete operation.
+   *
+   * @param columnFamilyName Column Family name
+   * @param key Key to be deleted
+   */
+  public <K extends Serializable> void delete(String columnFamilyName, K key) {
+    try {
+      getRocksDB().delete(managedHandlesMap.get(columnFamilyName), defaultWriteOptions, SerializationUtils.serialize(key));
+    } catch (Exception e) {
+      throw new HoodieException(e);
+    }
+  }
+
+  /**
+   * Retrieve a value for a given key in a column family.
+   *
+   * @param columnFamilyName Column Family Name
+   * @param key Key to be retrieved
+   * @param <T> Type of object stored.
+   */
+  public <T extends Serializable> T get(String columnFamilyName, String key) {
+    return get(columnFamilyName, getKeyBytes(key));
+  }
+
+  /**
+   * Retrieve a value for a given key in a column family.
+   *
+   * @param columnFamilyName Column Family Name
+   * @param key Key to be retrieved
+   * @param <T> Type of object stored.
+   */
+  public <K extends Serializable, T extends Serializable> T get(String columnFamilyName, K key) {
+    return get(columnFamilyName, getKeyBytes(key));
+  }
+
+  /**
+   * Retrieve a value for a given key in a column family.
+   *
+   * @param columnFamilyName Column Family Name
+   * @param key Key to be retrieved
+   * @param <T> Type of object stored.
+   */
+  public <K extends Serializable, T extends Serializable> T get(String columnFamilyName, byte[] key) {
+    ValidationUtils.checkArgument(!closed);
+    try {
+      byte[] val = getRocksDB().get(managedHandlesMap.get(columnFamilyName), key);
+      return deserializePayload(columnFamilyName, val);
+    } catch (Exception e) {
+      throw new HoodieException(e);
+    }
+  }
+
+  /**
+   * Perform a prefix search and return stream of key-value pairs retrieved.
+   *
+   * @param columnFamilyName Column Family Name
+   * @param prefix Prefix Key
+   * @param <T> Type of value stored
+   */
+  public <T extends Serializable> Stream<Pair<String, T>> prefixSearch(String columnFamilyName, String prefix) {
+    List<Pair<String, T>> results = new ArrayList<>();
+    this.<T, RuntimeException>prefixSearch(columnFamilyName, prefix, (key, value) -> results.add(Pair.of(key, value)));
+    return results.stream();
+  }
+
+  /**
+   * Visits matching entries synchronously without collecting them in memory. The iterator is
+   * closed before returning, including when the handler throws an exception.
+   *
+   * @param columnFamilyName Column family name
+   * @param prefix Prefix key
+   * @param handler Handler invoked once per matching entry, in key order
+   * @param <T> Type of value stored
+   * @param <E> Type of exception thrown by the handler
+   */
+  public <T extends Serializable, E extends Exception> void prefixSearch(
+      String columnFamilyName, String prefix, PrefixSearchHandler<T, E> handler) throws E {
+    ValidationUtils.checkArgument(!closed);
+    final boolean debug = log.isDebugEnabled();
+    final HoodieTimer timer = debug ? HoodieTimer.start() : null;
+    long count = 0;
+    try (final RocksIterator it = getRocksDB().newIterator(managedHandlesMap.get(columnFamilyName))) {
+      it.seek(getUTF8Bytes(prefix));
+      while (it.isValid()) {
+        String key = fromUTF8Bytes(it.key());
+        if (!key.startsWith(prefix)) {
+          break;
+        }
+        handler.accept(key, deserializePayload(columnFamilyName, it.value()));
+        count++;
+        it.next();
+      }
+    }
+
+    if (debug) {
+      log.debug("Prefix Search for (query={}) on {}. Total Time Taken (msec)={}, num entries={}",
+          prefix, columnFamilyName, timer.endTimer(), count);
+    }
+  }
+
+  /**
+   * Return Iterator of key-value pairs from RocksIterator.
+   *
+   * @param columnFamilyName Column Family Name
+   * @param <T>              Type of key stored
+   * @param <R>              Type of value stored
+   */
+  public <T extends Serializable, R> Iterator<Pair<T, R>> iterator(String columnFamilyName) {
+    return new IteratorWrapper<>(getRocksDB().newIterator(managedHandlesMap.get(columnFamilyName)), getSerializerForColumnFamily(columnFamilyName));
+  }
+
+  /**
+   * Perform a prefix delete and return stream of key-value pairs retrieved.
+   *
+   * @param columnFamilyName Column Family Name
+   * @param prefix Prefix Key
+   * @param <T> Type of value stored
+   */
+  public <T extends Serializable> void prefixDelete(String columnFamilyName, String prefix) {
+    ValidationUtils.checkArgument(!closed);
+    log.info("Prefix DELETE (query={}) on {}", prefix, columnFamilyName);
+    final RocksIterator it = getRocksDB().newIterator(managedHandlesMap.get(columnFamilyName));
+    it.seek(getUTF8Bytes(prefix));
+    // Find first and last keys to be deleted
+    String firstEntry = null;
+    String lastEntry = null;
+    while (it.isValid() && fromUTF8Bytes(it.key()).startsWith(prefix)) {
+      String result = fromUTF8Bytes(it.key());
+      it.next();
+      if (firstEntry == null) {
+        firstEntry = result;
+      }
+      lastEntry = result;
+    }
+    it.close();
+
+    if (null != firstEntry) {
+      try {
+        // This will not delete the last entry
+        getRocksDB().deleteRange(managedHandlesMap.get(columnFamilyName), getUTF8Bytes(firstEntry), getUTF8Bytes(lastEntry));
+        // Delete the last entry
+        getRocksDB().delete(managedHandlesMap.get(columnFamilyName), defaultWriteOptions, getUTF8Bytes(lastEntry));
+      } catch (RocksDBException e) {
+        log.error("Got exception performing range delete");
+        throw new HoodieException(e);
+      }
+    }
+  }
+
+  /**
+   * Add a new column family to store.
+   *
+   * @param columnFamilyName Column family name
+   */
+  public void addColumnFamily(String columnFamilyName) {
+    ValidationUtils.checkArgument(!closed);
+
+    managedDescriptorMap.computeIfAbsent(columnFamilyName, colFamilyName -> {
+      try {
+        ColumnFamilyDescriptor descriptor = getColumnFamilyDescriptor(StringUtils.getUTF8Bytes(colFamilyName));
+        ColumnFamilyHandle handle = getRocksDB().createColumnFamily(descriptor);
+        managedHandlesMap.put(colFamilyName, handle);
+        return descriptor;
+      } catch (RocksDBException e) {
+        throw new HoodieException(e);
+      }
+    });
+  }
+
+  /**
+   * Returns whether a column family with the given name currently exists.
+   *
+   * @param columnFamilyName Column family name
+   */
+  public boolean columnFamilyExists(String columnFamilyName) {
+    return managedDescriptorMap.containsKey(columnFamilyName);
+  }
+
+  /**
+   * Lists the names of all currently managed column families.
+   */
+  public List<String> listColumnFamilies() {
+    return new ArrayList<>(managedDescriptorMap.keySet());
+  }
+
+  /**
+   * Retrieves a numeric property aggregated across all column families.
+   */
+  public synchronized long getLongProperty(String property) throws RocksDBException {
+    return closed ? 0L : getRocksDB().getAggregatedLongProperty(property);
+  }
+
+  /**
+   * Retrieves the current ticker count.
+   */
+  public synchronized long getTickerCount(TickerType tickerType) {
+    return closed || statistics == null ? 0L : statistics.getTickerCount(tickerType);
+  }
+
+  /**
+   * Note : Does not delete from underlying DB. Just closes the handle.
+   *
+   * @param columnFamilyName Column Family Name
+   */
+  public void dropColumnFamily(String columnFamilyName) {
+    ValidationUtils.checkArgument(!closed);
+
+    managedDescriptorMap.computeIfPresent(columnFamilyName, (colFamilyName, descriptor) -> {
+      ColumnFamilyHandle handle = managedHandlesMap.get(colFamilyName);
+      try {
+        getRocksDB().dropColumnFamily(handle);
+        handle.close();
+      } catch (RocksDBException e) {
+        throw new HoodieException(e);
+      }
+      managedHandlesMap.remove(columnFamilyName);
+      descriptor.getOptions().close();
+      return null;
+    });
+  }
+
+  /**
+   * Close the DAO object.
+   */
+  public synchronized void close() {
+    if (!closed) {
+      closed = true;
+      managedHandlesMap.values().forEach(AbstractImmutableNativeReference::close);
+      managedHandlesMap.clear();
+      closeColumnFamilyDescriptors();
+      if (defaultWriteOptions != null) {
+        defaultWriteOptions.close();
+      }
+      getRocksDB().close();
+      // Every holder of the native LoggerJniCallback's shared_ptr must be released before its JNI
+      // global reference to this Logger is deleted: the DB (closed above), the DBOptions, the
+      // Options copy in loadManagedColumnFamilies, and the Logger itself. Order among them does
+      // not matter -- the last release is the one that frees it -- but skipping any one pins the
+      // Logger for the life of the JVM.
+      closeNativeOptions();
+      try {
+        FileIOUtils.deleteDirectory(new File(rocksDBBasePath));
+      } catch (IOException e) {
+        throw new HoodieIOException(e.getMessage(), e);
+      }
+    }
+  }
+
+  /**
+   * Each descriptor owns the native ColumnFamilyOptions allocated for it in
+   * getColumnFamilyDescriptor(), and rocksdbjni no longer frees a native reference on GC. Clearing
+   * the map without closing them leaks one struct per column family for the life of the JVM.
+   */
+  private void closeColumnFamilyDescriptors() {
+    if (managedDescriptorMap != null) {
+      managedDescriptorMap.values().forEach(descriptor -> descriptor.getOptions().close());
+      managedDescriptorMap.clear();
+    }
+  }
+
+  /**
+   * Releases the native options held by this DAO.
+   */
+  private void closeNativeOptions() {
+    if (statistics != null) {
+      statistics.close();
+      statistics = null;
+    }
+    if (logger != null) {
+      logger.close();
+      logger = null;
+    }
+    if (dbOptions != null) {
+      dbOptions.close();
+      dbOptions = null;
+    }
+  }
+
+  private <T> byte[] serializePayload(String columnFamily, T value) throws IOException {
+    CustomSerializer<T> serializer = getSerializerForColumnFamily(columnFamily);
+    byte[] payload = serializer.serialize(value);
+    totalBytesWritten += payload.length;
+    return payload;
+  }
+
+  private <T> T deserializePayload(String columnFamily, byte[] value) {
+    CustomSerializer<T> serializer = getSerializerForColumnFamily(columnFamily);
+    if (value == null) {
+      return null;
+    }
+    return serializer.deserialize(value);
+  }
+
+  private <T> CustomSerializer<T> getSerializerForColumnFamily(String columnFamily) {
+    return (CustomSerializer<T>) columnFamilySerializers.computeIfAbsent(columnFamily, cf -> new DefaultSerializer<>());
+  }
+
+  private byte[] getKeyBytes(String key) {
+    return getUTF8Bytes(key);
+  }
+
+  private <K extends Serializable> byte[] getKeyBytes(K key) {
+    try {
+      return SerializationUtils.serialize(key);
+    } catch (IOException e) {
+      throw new HoodieException(e);
+    }
+  }
+
+  /**
+   * Static so it cannot capture the enclosing {@link RocksDBDAO}. RocksDB's native layer holds a
+   * JNI global reference to this object for the lifetime of the callback, so an inner class would
+   * keep the whole DAO - its column-family maps included - reachable until that reference is
+   * released. Package-private, not private, so a test can drive the level mapping directly.
+   */
+  static final class RocksDBLogger extends org.rocksdb.Logger {
+
+    RocksDBLogger(DBOptions dbOptions) {
+      super(dbOptions);
+    }
+
+    @Override
+    protected void log(InfoLogLevel infoLogLevel, String logMsg) {
+      switch (infoLogLevel) {
+        case DEBUG_LEVEL:
+          log.debug("From Rocks DB : {}", logMsg);
+          break;
+        case WARN_LEVEL:
+          log.warn("From Rocks DB : {}", logMsg);
+          break;
+        case ERROR_LEVEL:
+        case FATAL_LEVEL:
+          log.error("From Rocks DB : {}", logMsg);
+          break;
+        case HEADER_LEVEL:
+        case NUM_INFO_LOG_LEVELS:
+        case INFO_LEVEL:
+        default:
+          log.info("From Rocks DB : {}", logMsg);
+          break;
+      }
+    }
+  }
+
+  /**
+   * {@link Iterator} wrapper for RocksDb Iterator {@link RocksIterator}.
+   */
+  private static class IteratorWrapper<T, R> implements Iterator<Pair<T, R>> {
+
+    private final RocksIterator iterator;
+    private final CustomSerializer<R> deserializer;
+
+    public IteratorWrapper(final RocksIterator iterator, final CustomSerializer<R> deserializer) {
+      this.iterator = iterator;
+      this.deserializer = deserializer;
+      iterator.seekToFirst();
+    }
+
+    @Override
+    public boolean hasNext() {
+      return iterator.isValid();
+    }
+
+    @Override
+    public Pair<T, R> next() {
+      if (!hasNext()) {
+        throw new IllegalStateException("next() called on rocksDB with no more valid entries");
+      }
+      T key = SerializationUtils.deserialize(iterator.key());
+      R val = deserializer.deserialize(iterator.value());
+      iterator.next();
+      return Pair.of(key, val);
+    }
+  }
+
+  /**
+   * Functional interface for stacking operation to Write batch.
+   */
+  public interface BatchHandler {
+
+    void apply(WriteBatch batch);
+  }
+
+  /**
+   * Handler for a prefix search that may propagate a checked exception to the caller.
+   */
+  @FunctionalInterface
+  public interface PrefixSearchHandler<T, E extends Exception> {
+
+    void accept(String key, T value) throws E;
+  }
+}

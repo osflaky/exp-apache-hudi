@@ -1,0 +1,698 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.hudi.cli.commands;
+
+import org.apache.hudi.avro.model.HoodieActionInstant;
+import org.apache.hudi.avro.model.HoodieCleanFileInfo;
+import org.apache.hudi.avro.model.HoodieCleanerPlan;
+import org.apache.hudi.cli.HoodieCLI;
+import org.apache.hudi.cli.HoodiePrintHelper;
+import org.apache.hudi.cli.HoodieTableHeaderFields;
+import org.apache.hudi.cli.functional.CLIFunctionalTestHarness;
+import org.apache.hudi.cli.testutils.HoodieTestCommitMetadataGenerator;
+import org.apache.hudi.cli.testutils.ShellEvaluationResultUtil;
+import org.apache.hudi.client.SparkRDDWriteClient;
+import org.apache.hudi.client.WriteClientTestUtils;
+import org.apache.hudi.client.WriteStatus;
+import org.apache.hudi.common.fs.FSUtils;
+import org.apache.hudi.common.model.HoodieAvroIndexedRecord;
+import org.apache.hudi.common.model.HoodieCleaningPolicy;
+import org.apache.hudi.common.model.HoodieKey;
+import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.model.HoodieTableType;
+import org.apache.hudi.common.table.HoodieTableConfig;
+import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.HoodieTableVersion;
+import org.apache.hudi.common.table.timeline.HoodieInstant;
+import org.apache.hudi.common.table.timeline.HoodieTimeline;
+import org.apache.hudi.common.table.timeline.versioning.clean.CleanPlanV2MigrationHandler;
+import org.apache.hudi.common.testutils.FileCreateUtils;
+import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
+import org.apache.hudi.common.util.HoodieStorageUtils;
+import org.apache.hudi.common.util.PartitionPathEncodeUtils;
+import org.apache.hudi.config.HoodieWriteConfig;
+import org.apache.hudi.exception.HoodieIOException;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
+import org.apache.hudi.io.util.FileIOUtils;
+import org.apache.hudi.keygen.SimpleKeyGenerator;
+import org.apache.hudi.storage.StorageConfiguration;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.hadoop.HoodieHadoopStorage;
+import org.apache.hudi.testutils.Assertions;
+
+import org.apache.avro.file.DataFileWriter;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.specific.SpecificDatumWriter;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LogEvent;
+import org.apache.logging.log4j.core.Logger;
+import org.apache.logging.log4j.core.appender.AbstractAppender;
+import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.sql.SQLContext;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.shell.Shell;
+
+import java.io.FileInputStream;
+import java.io.FilterInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.SocketTimeoutException;
+import java.net.URL;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.TreeSet;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+import static org.apache.hudi.common.table.HoodieTableConfig.DROP_PARTITION_COLUMNS;
+import static org.apache.hudi.common.table.HoodieTableConfig.TABLE_CHECKSUM;
+import static org.apache.hudi.common.table.HoodieTableConfig.generateChecksum;
+import static org.apache.hudi.common.table.HoodieTableConfig.validateChecksum;
+import static org.apache.hudi.common.testutils.HoodieTestDataGenerator.DEFAULT_FIRST_PARTITION_PATH;
+import static org.apache.hudi.common.testutils.HoodieTestDataGenerator.TRIP_EXAMPLE_SCHEMA;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Test class for {@link RepairsCommand}.
+ */
+@Tag("functional")
+@SpringBootTest(properties = {"spring.shell.interactive.enabled=false", "spring.shell.command.script.enabled=false"})
+public class TestRepairsCommand extends CLIFunctionalTestHarness {
+
+  @Autowired
+  private Shell shell;
+
+  private String tablePath;
+  private FileSystem fs;
+
+  @BeforeEach
+  public void init() throws IOException {
+    String tableName = tableName();
+    tablePath = tablePath(tableName);
+    fs = HadoopFSUtils.getFs(tablePath, storageConf());
+
+    // Create table and connect
+    new TableCommand().createTable(
+        tablePath, tableName, HoodieTableType.COPY_ON_WRITE.name(),
+        HoodieTableConfig.TIMELINE_HISTORY_PATH.defaultValue(), HoodieTableVersion.current().versionCode(), "org.apache.hudi.common.model.HoodieAvroPayload");
+  }
+
+  @AfterEach
+  public void cleanUp() throws IOException {
+    fs.close();
+  }
+
+  /**
+   * Test case for dry run 'repair addpartitionmeta'.
+   */
+  @Test
+  public void testAddPartitionMetaWithDryRun() throws IOException {
+    // create commit instant
+    FileCreateUtils.createCommit(HoodieCLI.getTableMetaClient(), "100");
+
+    // create partition path
+    String partition1 = Paths.get(tablePath, HoodieTestDataGenerator.DEFAULT_FIRST_PARTITION_PATH).toString();
+    String partition2 = Paths.get(tablePath, HoodieTestDataGenerator.DEFAULT_SECOND_PARTITION_PATH).toString();
+    String partition3 = Paths.get(tablePath, HoodieTestDataGenerator.DEFAULT_THIRD_PARTITION_PATH).toString();
+    assertTrue(fs.mkdirs(new Path(partition1)));
+    assertTrue(fs.mkdirs(new Path(partition2)));
+    assertTrue(fs.mkdirs(new Path(partition3)));
+
+    // default is dry run.
+    Object result = shell.evaluate(() -> "repair addpartitionmeta");
+    assertTrue(ShellEvaluationResultUtil.isSuccess(result));
+
+    // expected all 'No'.
+    String[][] rows = FSUtils.getAllPartitionFoldersThreeLevelsDown(
+        HoodieStorageUtils.getStorage(
+            HadoopFSUtils.convertToStoragePath(new Path(tablePath)),
+            HadoopFSUtils.getStorageConf(fs.getConf())), tablePath)
+        .stream()
+        .map(partition -> new String[] {partition, "No", "None"})
+        .toArray(String[][]::new);
+    String expected = HoodiePrintHelper.print(new String[] {HoodieTableHeaderFields.HEADER_PARTITION_PATH,
+        HoodieTableHeaderFields.HEADER_METADATA_PRESENT, HoodieTableHeaderFields.HEADER_ACTION}, rows);
+    expected = removeNonWordAndStripSpace(expected);
+    String got = removeNonWordAndStripSpace(result.toString());
+    assertEquals(expected, got);
+  }
+
+  /**
+   * Test case for real run 'repair addpartitionmeta'.
+   */
+  @Test
+  public void testAddPartitionMetaWithRealRun() throws IOException {
+    // create commit instant
+    FileCreateUtils.createCommit(HoodieCLI.getTableMetaClient(), "100");
+
+    // create partition path
+    String partition1 = Paths.get(tablePath, HoodieTestDataGenerator.DEFAULT_FIRST_PARTITION_PATH).toString();
+    String partition2 = Paths.get(tablePath, HoodieTestDataGenerator.DEFAULT_SECOND_PARTITION_PATH).toString();
+    String partition3 = Paths.get(tablePath, HoodieTestDataGenerator.DEFAULT_THIRD_PARTITION_PATH).toString();
+    assertTrue(fs.mkdirs(new Path(partition1)));
+    assertTrue(fs.mkdirs(new Path(partition2)));
+    assertTrue(fs.mkdirs(new Path(partition3)));
+
+    Object result = shell.evaluate(() -> "repair addpartitionmeta --dryrun false");
+    assertTrue(ShellEvaluationResultUtil.isSuccess(result));
+
+    List<String> paths = FSUtils.getAllPartitionFoldersThreeLevelsDown(
+        HoodieStorageUtils.getStorage(
+            HadoopFSUtils.convertToStoragePath(new Path(tablePath)),
+            HadoopFSUtils.getStorageConf(fs.getConf())), tablePath);
+    // after dry run, the action will be 'Repaired'
+    String[][] rows = paths.stream()
+        .map(partition -> new String[] {partition, "No", "Repaired"})
+        .toArray(String[][]::new);
+    String expected = HoodiePrintHelper.print(new String[] {HoodieTableHeaderFields.HEADER_PARTITION_PATH,
+        HoodieTableHeaderFields.HEADER_METADATA_PRESENT, HoodieTableHeaderFields.HEADER_ACTION}, rows);
+    expected = removeNonWordAndStripSpace(expected);
+    String got = removeNonWordAndStripSpace(result.toString());
+    assertEquals(expected, got);
+
+    result = shell.evaluate(() -> "repair addpartitionmeta");
+
+    // after real run, Metadata is present now.
+    rows = paths.stream()
+        .map(partition -> new String[] {partition, "Yes", "None"})
+        .toArray(String[][]::new);
+    expected = HoodiePrintHelper.print(new String[] {HoodieTableHeaderFields.HEADER_PARTITION_PATH,
+        HoodieTableHeaderFields.HEADER_METADATA_PRESENT, HoodieTableHeaderFields.HEADER_ACTION}, rows);
+    expected = removeNonWordAndStripSpace(expected);
+    got = removeNonWordAndStripSpace(result.toString());
+    assertEquals(expected, got);
+  }
+
+  /**
+   * Test case for 'repair overwrite-hoodie-props'.
+   */
+  @Test
+  public void testOverwriteHoodieProperties() throws Exception {
+    URL newProps = this.getClass().getClassLoader().getResource("table-config.properties");
+    assertNotNull(newProps, "New property file must exist");
+
+    Object cmdResult = shell.evaluate(() -> "repair overwrite-hoodie-props --new-props-file " + newProps.getPath());
+    assertTrue(ShellEvaluationResultUtil.isSuccess(cmdResult));
+
+    Map<String, String> oldProps = HoodieCLI.getTableMetaClient().getTableConfig().propsMap();
+
+    // after overwrite, the stored value in .hoodie is equals to which read from properties.
+    HoodieTableConfig tableConfig = HoodieTableMetaClient.reload(HoodieCLI.getTableMetaClient()).getTableConfig();
+    Map<String, String> result = tableConfig.propsMap();
+    // validate table checksum
+    assertTrue(result.containsKey(TABLE_CHECKSUM.key()));
+    assertTrue(validateChecksum(tableConfig.getProps()));
+    Properties expectProps = new Properties();
+    expectProps.load(new FileInputStream(newProps.getPath()));
+
+    Map<String, String> expected = expectProps.entrySet().stream()
+        .collect(Collectors.toMap(e -> String.valueOf(e.getKey()), e -> String.valueOf(e.getValue())));
+    expected.putIfAbsent(TABLE_CHECKSUM.key(), String.valueOf(generateChecksum(tableConfig.getProps())));
+    expected.putIfAbsent(DROP_PARTITION_COLUMNS.key(), String.valueOf(DROP_PARTITION_COLUMNS.defaultValue()));
+
+    // Properties that Hudi 1.x fills in on its own: the new-props file sets none of the three, so
+    // HoodieTableConfig.create writes its own defaults for the two paths and the command carries
+    // the initial table version over from the old properties. All three are fixed values here,
+    // never read back out of what the command wrote.
+    expected.putIfAbsent(HoodieTableConfig.TIMELINE_PATH.key(), HoodieTableConfig.TIMELINE_PATH.defaultValue());
+    expected.putIfAbsent(HoodieTableConfig.TIMELINE_HISTORY_PATH.key(), HoodieTableConfig.TIMELINE_HISTORY_PATH.defaultValue());
+    expected.putIfAbsent(HoodieTableConfig.INITIAL_VERSION.key(), String.valueOf(HoodieTableVersion.current().versionCode()));
+
+    assertEquals(expected, result);
+
+    // the rendered table lists one row per property, with its old and new value
+    TreeSet<String> allPropKeys = new TreeSet<>(oldProps.keySet());
+    allPropKeys.addAll(result.keySet());
+    String[][] rows = allPropKeys.stream()
+        .map(key -> new String[] {key, oldProps.getOrDefault(key, "null"), result.getOrDefault(key, "null")})
+        .toArray(String[][]::new);
+    String expect = HoodiePrintHelper.print(new String[] {HoodieTableHeaderFields.HEADER_HOODIE_PROPERTY,
+        HoodieTableHeaderFields.HEADER_OLD_VALUE, HoodieTableHeaderFields.HEADER_NEW_VALUE}, rows);
+    assertEquals(removeNonWordAndStripSpace(expect), removeNonWordAndStripSpace(cmdResult.toString()));
+  }
+
+  /**
+   * Test case for 'repair corrupted clean files'.
+   */
+  @Test
+  public void testRemoveCorruptedPendingCleanAction() throws IOException {
+    HoodieCLI.conf = storageConf();
+
+    StorageConfiguration<?> conf = HoodieCLI.conf;
+
+    HoodieTableMetaClient metaClient = HoodieCLI.getTableMetaClient();
+
+    // Create four requested files
+    for (int i = 100; i < 104; i++) {
+      String timestamp = String.valueOf(i);
+      // Write an empty requested Clean File
+      HoodieTestCommitMetadataGenerator.createEmptyCleanRequestedFile(tablePath, timestamp, conf);
+    }
+
+    // A plan cut short mid-write, so that its bytes stop inside the Avro header
+    FileCreateUtils.createRequestedCleanFile(metaClient, "104", validCleanerPlan());
+    truncateInHalf(metaClient, requestedCleanPath(metaClient, "104"));
+
+    // A plan whose writer was killed between opening and closing the Avro container, which leaves a
+    // complete header and no record behind
+    try (DataFileWriter<HoodieCleanerPlan> writer =
+             new DataFileWriter<>(new SpecificDatumWriter<>(HoodieCleanerPlan.class))) {
+      writer.create(HoodieCleanerPlan.getClassSchema(),
+          metaClient.getStorage().create(requestedCleanPath(metaClient, "105"), true));
+    }
+
+    // A plan that decodes, which the command has to leave in place
+    FileCreateUtils.createRequestedCleanFile(metaClient, "106", validCleanerPlan());
+
+    // reload meta client
+    metaClient = HoodieTableMetaClient.reload(metaClient);
+    // first, there are seven pending instants
+    assertEquals(7, metaClient.getActiveTimeline().filterInflightsAndRequested().countInstants());
+
+    Object cleanResult = shell.evaluate(() -> "repair corrupted clean files");
+    assertTrue(ShellEvaluationResultUtil.isSuccess(cleanResult));
+
+    // reload meta client
+    metaClient = HoodieTableMetaClient.reload(metaClient);
+    // the empty, the truncated and the record-less plans are gone and the readable one is untouched
+    List<HoodieInstant> remaining =
+        metaClient.getActiveTimeline().filterInflightsAndRequested().getInstants();
+    assertEquals(1, remaining.size());
+    assertEquals("106", remaining.get(0).requestedTime());
+  }
+
+  /**
+   * A transient read failure on a valid pending clean plan must not be taken for corruption:
+   * the timeline serde wraps any exception raised while it streams the plan file in the same
+   * "unable to read commit metadata" IOException that an empty or truncated file raises.
+   */
+  @Test
+  public void testRemoveCorruptedPendingCleanActionKeepsPlanOnReadFailure() throws IOException {
+    HoodieCLI.conf = storageConf();
+    HoodieTableMetaClient metaClient = HoodieCLI.getTableMetaClient();
+    FileCreateUtils.createRequestedCleanFile(metaClient, "100", validCleanerPlan());
+    StoragePath planPath = requestedCleanPath(metaClient, "100");
+
+    HoodieTableMetaClient timingOutClient = HoodieTableMetaClient.builder()
+        .setStorage(new TimingOutStorage(fs, planPath)).setBasePath(tablePath).build();
+    HoodieIOException thrown = assertThrows(HoodieIOException.class,
+        () -> RepairsCommand.removeCorruptedPendingCleanAction(timingOutClient));
+    assertInstanceOf(SocketTimeoutException.class, thrown.getCause());
+    assertTrue(metaClient.getStorage().exists(planPath));
+
+    // the same plan read through a healthy storage is left alone as well
+    RepairsCommand.removeCorruptedPendingCleanAction(HoodieTableMetaClient.reload(metaClient));
+    assertEquals(1, HoodieTableMetaClient.reload(metaClient).getActiveTimeline()
+        .filterInflightsAndRequested().countInstants());
+  }
+
+  /**
+   * A clean that reached inflight keeps its plan in the requested file, so a corrupt plan has to
+   * take both files with it. The timeline collapses the two states into the inflight instant
+   * alone, so removing only the instant it listed would leave the corrupt plan behind for the
+   * next clean to fail on, and take a second run of this command to clear.
+   */
+  @Test
+  public void testRemoveCorruptedPendingCleanActionRemovesInflightAndItsPlan() throws IOException {
+    HoodieCLI.conf = storageConf();
+    HoodieTableMetaClient metaClient = HoodieCLI.getTableMetaClient();
+
+    // a clean that was scheduled and started, whose plan was then cut short
+    FileCreateUtils.createRequestedCleanFile(metaClient, "100", validCleanerPlan());
+    // the inflight file a clean leaves behind carries no plan of its own
+    FileCreateUtils.createInflightCleanFile(metaClient, "100", null, true);
+    truncateInHalf(metaClient, requestedCleanPath(metaClient, "100"));
+
+    StoragePath inflightPath = new StoragePath(metaClient.getTimelinePath(),
+        metaClient.getInstantFileNameGenerator().makeInflightCleanerFileName("100"));
+    assertTrue(metaClient.getStorage().exists(inflightPath));
+
+    metaClient = HoodieTableMetaClient.reload(metaClient);
+    List<HoodieInstant> pending = metaClient.getActiveTimeline().filterInflightsAndRequested().getInstants();
+    assertEquals(1, pending.size());
+    assertTrue(pending.get(0).isInflight());
+
+    RepairsCommand.removeCorruptedPendingCleanAction(metaClient);
+
+    // one pass takes the whole action, not just the file the timeline listed
+    assertFalse(metaClient.getStorage().exists(inflightPath));
+    assertFalse(metaClient.getStorage().exists(requestedCleanPath(metaClient, "100")));
+    assertEquals(0, HoodieTableMetaClient.reload(metaClient).getActiveTimeline()
+        .filterInflightsAndRequested().countInstants());
+  }
+
+  /**
+   * Corrupt bytes do not always reach the decoder as an Avro failure: a plan that decodes with no
+   * version leaves the migrator to unbox a null, and a length that survives as far as Avro's own
+   * ceiling raises an {@code UnsupportedOperationException}. Such an instant has to be judged
+   * corrupt like any other, and the instants behind it still repaired, rather than the failure
+   * escaping and abandoning the rest of the timeline.
+   */
+  @Test
+  public void testRemoveCorruptedPendingCleanActionRepairsPastAnUndecodablePlan() throws IOException {
+    HoodieCLI.conf = storageConf();
+    HoodieTableMetaClient metaClient = HoodieCLI.getTableMetaClient();
+
+    HoodieCleanerPlan versionless = validCleanerPlan();
+    versionless.setVersion(null);
+    writeCleanerPlan(metaClient, "100", versionless);
+
+    // an ordinary corruption behind it, which is only reached if the first one does not escape
+    HoodieTestCommitMetadataGenerator.createEmptyCleanRequestedFile(tablePath, "101", HoodieCLI.conf);
+    // and a readable plan the command has to leave in place
+    FileCreateUtils.createRequestedCleanFile(metaClient, "102", validCleanerPlan());
+
+    metaClient = HoodieTableMetaClient.reload(metaClient);
+    assertEquals(3, metaClient.getActiveTimeline().filterInflightsAndRequested().countInstants());
+
+    RepairsCommand.removeCorruptedPendingCleanAction(metaClient);
+
+    List<HoodieInstant> remaining = HoodieTableMetaClient.reload(metaClient)
+        .getActiveTimeline().filterInflightsAndRequested().getInstants();
+    assertEquals(1, remaining.size());
+    assertEquals("102", remaining.get(0).requestedTime());
+  }
+
+  /**
+   * Cuts a file's bytes in half in place. The file is overwritten rather than deleted and
+   * rewritten, because both the emptiness check and the file name generator resolve the file
+   * from the instant itself.
+   */
+  private static void truncateInHalf(HoodieTableMetaClient metaClient, StoragePath path) throws IOException {
+    byte[] bytes;
+    try (InputStream in = metaClient.getStorage().open(path)) {
+      bytes = FileIOUtils.readAsByteArray(in);
+    }
+    try (OutputStream out = metaClient.getStorage().create(path, true)) {
+      out.write(bytes, 0, bytes.length / 2);
+    }
+  }
+
+  /**
+   * Writes a clean plan straight into the requested file of an instant, so that a plan the
+   * timeline's own writer would not produce still reaches the command.
+   */
+  private static void writeCleanerPlan(HoodieTableMetaClient metaClient, String instantTime,
+                                       HoodieCleanerPlan plan) throws IOException {
+    try (DataFileWriter<HoodieCleanerPlan> writer =
+             new DataFileWriter<>(new SpecificDatumWriter<>(HoodieCleanerPlan.class))) {
+      writer.create(HoodieCleanerPlan.getClassSchema(),
+          metaClient.getStorage().create(requestedCleanPath(metaClient, instantTime), true));
+      writer.append(plan);
+    }
+  }
+
+  /**
+   * The path of the requested file of a clean instant.
+   */
+  private static StoragePath requestedCleanPath(HoodieTableMetaClient metaClient, String instantTime) {
+    return new StoragePath(metaClient.getTimelinePath(),
+        metaClient.getInstantFileNameGenerator().makeRequestedCleanerFileName(instantTime));
+  }
+
+  /**
+   * A clean plan that decodes into the latest plan version.
+   */
+  private static HoodieCleanerPlan validCleanerPlan() {
+    return HoodieCleanerPlan.newBuilder()
+        .setEarliestInstantToRetain(HoodieActionInstant.newBuilder()
+            .setAction(HoodieTimeline.COMMIT_ACTION).setTimestamp("001")
+            .setState(HoodieInstant.State.COMPLETED.name()).build())
+        .setFilesToBeDeletedPerPartition(Collections.singletonMap("partition1", Collections.singletonList("file1")))
+        .setFilePathsToBeDeletedPerPartition(Collections.singletonMap("partition1",
+            Collections.singletonList(HoodieCleanFileInfo.newBuilder().setFilePath("file1").build())))
+        .setLastCompletedCommitTimestamp("002")
+        .setPolicy(HoodieCleaningPolicy.KEEP_LATEST_COMMITS.name())
+        .setVersion(CleanPlanV2MigrationHandler.VERSION)
+        .build();
+  }
+
+  /**
+   * Testcase for "repair cleanup empty commit metadata"
+   *
+   */
+  @Test
+  public void testShowFailedCommits() throws Exception {
+    HoodieCLI.conf = storageConf();
+
+    StorageConfiguration<?> conf = HoodieCLI.conf;
+
+    HoodieTableMetaClient metaClient = HoodieCLI.getTableMetaClient();
+
+    // Every commit starts with real metadata, so none of them is empty yet.
+    for (int i = 1; i < 20; i++) {
+      HoodieTestCommitMetadataGenerator.createCommitFileWithMetadata(tablePath, String.valueOf(i), conf);
+    }
+
+    HoodieTableMetaClient reloaded = HoodieTableMetaClient.reload(metaClient);
+    // Truncate a subset in place. Rewriting via createCompleteInstant would mint a fresh
+    // completion time and leave the instant name pointing at a file that no longer exists.
+    List<HoodieInstant> allInstants = reloaded.getActiveTimeline().getInstantsAsStream().collect(Collectors.toList());
+    List<HoodieInstant> emptied = allInstants.stream()
+        .filter(instant -> Integer.parseInt(instant.requestedTime()) % 4 == 0)
+        .collect(Collectors.toList());
+    for (HoodieInstant instant : emptied) {
+      Path instantPath = new Path(reloaded.getTimelinePath().toString(),
+          reloaded.getInstantFileNameGenerator().getFileName(instant));
+      HoodieTestDataGenerator.createEmptyFile(tablePath, instantPath, conf);
+    }
+    // A proper subset, so the command has to filter rather than report everything.
+    assertTrue(emptied.size() > 0 && emptied.size() < allInstants.size(),
+        "truncated " + emptied.size() + " of " + allInstants.size() + " instants; expected a proper subset");
+
+    final TestLogAppender appender = new TestLogAppender();
+    final Logger logger = (Logger) LogManager.getLogger(RepairsCommand.class);
+    try {
+      appender.start();
+      logger.addAppender(appender);
+      Object result = shell.evaluate(() -> "repair show empty commit metadata");
+      assertTrue(ShellEvaluationResultUtil.isSuccess(result));
+      final List<LogEvent> log = appender.getLog();
+      // only the instants truncated above should be flagged as empty
+      assertEquals(emptied.size(), log.size());
+      log.forEach(LoggingEvent -> {
+        assertEquals(LoggingEvent.getLevel(), Level.WARN);
+        assertTrue(LoggingEvent.getMessage().getFormattedMessage().contains("Empty Commit: "));
+        assertTrue(LoggingEvent.getMessage().getFormattedMessage().contains("COMPLETED]"));
+      });
+    } finally {
+      logger.removeAppender(appender);
+    }
+
+
+  }
+
+  @Test
+  public void testRepairDeprecatedPartition() throws IOException {
+    tablePath = tablePath + "/repair_test/";
+    HoodieTableMetaClient.newTableBuilder()
+        .setTableType(HoodieTableType.COPY_ON_WRITE.name())
+        .setTableName(tableName())
+        .setArchiveLogFolder(HoodieTableConfig.TIMELINE_HISTORY_PATH.defaultValue())
+        .setPayloadClassName("org.apache.hudi.common.model.HoodieAvroPayload")
+        .setPartitionFields("partition_path")
+        .setRecordKeyFields("_row_key")
+        .setKeyGeneratorClassProp(SimpleKeyGenerator.class.getCanonicalName())
+        .setTableVersion(HoodieTableVersion.current().versionCode())
+        .initTable(HoodieCLI.conf.newInstance(), tablePath);
+
+    HoodieTestDataGenerator dataGen = new HoodieTestDataGenerator();
+    HoodieWriteConfig config = HoodieWriteConfig.newBuilder().withPath(tablePath).withSchema(TRIP_EXAMPLE_SCHEMA).build();
+
+    try (SparkRDDWriteClient client = new SparkRDDWriteClient(context(), config)) {
+      String newCommitTime = "001";
+      int numRecords = 10;
+      WriteClientTestUtils.startCommitWithTime(client, newCommitTime);
+
+      List<HoodieRecord> records = dataGen.generateInserts(newCommitTime, numRecords);
+      JavaRDD<HoodieRecord> writeRecords = context().getJavaSparkContext().parallelize(records, 1);
+      List<WriteStatus> result = client.upsert(writeRecords, newCommitTime).collect();
+      Assertions.assertNoWriteErrors(result);
+      client.commit(newCommitTime, jsc().parallelize(result));
+
+      newCommitTime = "002";
+      // Generate HoodieRecords w/ null values for partition path field.
+      List<HoodieRecord> records1 = dataGen.generateInserts(newCommitTime, numRecords);
+      List<HoodieRecord> records2 = new ArrayList<>();
+      records1.forEach(entry -> {
+        HoodieKey hoodieKey = new HoodieKey(entry.getRecordKey(), PartitionPathEncodeUtils.DEPRECATED_DEFAULT_PARTITION_PATH);
+        GenericRecord genericRecord = (GenericRecord) entry.getData();
+        genericRecord.put("partition_path", null);
+        records2.add(new HoodieAvroIndexedRecord(hoodieKey, genericRecord));
+      });
+
+      WriteClientTestUtils.startCommitWithTime(client, newCommitTime);
+      // ingest records2 which has null for partition path fields, but goes into "default" partition.
+      JavaRDD<HoodieRecord> writeRecords2 = context().getJavaSparkContext().parallelize(records2, 1);
+      List<WriteStatus> result2 = client.bulkInsert(writeRecords2, newCommitTime).collect();
+      Assertions.assertNoWriteErrors(result2);
+      client.commit(newCommitTime, jsc().parallelize(result2));
+
+      SQLContext sqlContext = context().getSqlContext();
+      long totalRecs = sqlContext.read().format("hudi").load(tablePath).count();
+      assertEquals(totalRecs, 20);
+
+      // Execute repair deprecated partition command
+      assertEquals(0, SparkMain.repairDeprecatedPartition(jsc(), tablePath));
+
+      // there should not be any records w/ default partition
+      totalRecs = sqlContext.read().format("hudi").load(tablePath)
+      .filter(HoodieRecord.PARTITION_PATH_METADATA_FIELD + " == '" + PartitionPathEncodeUtils.DEPRECATED_DEFAULT_PARTITION_PATH + "'").count();
+      assertEquals(totalRecs, 0);
+
+      // all records from default partition should have been migrated to __HIVE_DEFAULT_PARTITION__
+      totalRecs = sqlContext.read().format("hudi").load(tablePath)
+          .filter(HoodieRecord.PARTITION_PATH_METADATA_FIELD + " == '" + PartitionPathEncodeUtils.DEFAULT_PARTITION_PATH + "'").count();
+      assertEquals(totalRecs, 10);
+    }
+  }
+
+  @Test
+  public void testRenamePartition() throws IOException {
+    tablePath = tablePath + "/rename_partition_test/";
+    HoodieTableMetaClient.newTableBuilder()
+        .setTableType(HoodieTableType.COPY_ON_WRITE.name())
+        .setTableName(tableName())
+        .setArchiveLogFolder(HoodieTableConfig.TIMELINE_HISTORY_PATH.defaultValue())
+        .setPayloadClassName("org.apache.hudi.common.model.HoodieAvroPayload")
+        .setPartitionFields("partition_path")
+        .setRecordKeyFields("_row_key")
+        .setKeyGeneratorClassProp(SimpleKeyGenerator.class.getCanonicalName())
+        .setTableVersion(HoodieTableVersion.current().versionCode())
+        .initTable(HoodieCLI.conf.newInstance(), tablePath);
+
+    HoodieTestDataGenerator dataGen = new HoodieTestDataGenerator();
+    HoodieWriteConfig config = HoodieWriteConfig.newBuilder().withPath(tablePath).withSchema(TRIP_EXAMPLE_SCHEMA).build();
+
+    try (SparkRDDWriteClient client = new SparkRDDWriteClient(context(), config)) {
+      String newCommitTime = "001";
+      int numRecords = 20;
+      WriteClientTestUtils.startCommitWithTime(client, newCommitTime);
+
+      List<HoodieRecord> records = dataGen.generateInserts(newCommitTime, numRecords);
+      JavaRDD<HoodieRecord> writeRecords = context().getJavaSparkContext().parallelize(records, 1);
+      List<WriteStatus> result = client.upsert(writeRecords, newCommitTime).collect();
+      Assertions.assertNoWriteErrors(result);
+      client.commit(newCommitTime, jsc().parallelize(result));
+
+      SQLContext sqlContext = context().getSqlContext();
+      long totalRecs = sqlContext.read().format("hudi").load(tablePath).count();
+      assertEquals(totalRecs, 20);
+      long totalRecsInOldPartition = sqlContext.read().format("hudi").load(tablePath)
+          .filter(HoodieRecord.PARTITION_PATH_METADATA_FIELD + " == '" + DEFAULT_FIRST_PARTITION_PATH + "'").count();
+      // otherwise the final assertion below would be satisfied by 0 == 0
+      assertTrue(totalRecsInOldPartition > 0);
+
+      // Execute rename partition command
+      assertEquals(0, SparkMain.renamePartition(jsc(), tablePath, DEFAULT_FIRST_PARTITION_PATH, "2016/03/18"));
+
+      // there should not be any records in old partition
+      totalRecs = sqlContext.read().format("hudi").load(tablePath)
+          .filter(HoodieRecord.PARTITION_PATH_METADATA_FIELD + " == '" + DEFAULT_FIRST_PARTITION_PATH + "'").count();
+      assertEquals(totalRecs, 0);
+
+      // all records from old partition should have been migrated to new partition
+      totalRecs = sqlContext.read().format("hudi").load(tablePath)
+          .filter(HoodieRecord.PARTITION_PATH_METADATA_FIELD + " == \"" + "2016/03/18" + "\"").count();
+      assertEquals(totalRecs, totalRecsInOldPartition);
+    }
+  }
+
+  /**
+   * Storage whose read of one file times out part-way, the way a remote store does under a
+   * transient outage: the open succeeds and the stream fails after the first bytes.
+   */
+  private static class TimingOutStorage extends HoodieHadoopStorage {
+    private final StoragePath timingOutPath;
+
+    TimingOutStorage(FileSystem fs, StoragePath timingOutPath) {
+      super(fs);
+      this.timingOutPath = timingOutPath;
+    }
+
+    @Override
+    public InputStream open(StoragePath path) throws IOException {
+      InputStream in = super.open(path);
+      if (!path.equals(timingOutPath)) {
+        return in;
+      }
+      return new FilterInputStream(in) {
+        private int remaining = 32;
+
+        @Override
+        public int read() throws IOException {
+          if (remaining <= 0) {
+            throw new SocketTimeoutException("Read timed out");
+          }
+          remaining--;
+          return super.read();
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+          if (remaining <= 0) {
+            throw new SocketTimeoutException("Read timed out");
+          }
+          int read = super.read(buffer, offset, Math.min(length, remaining));
+          if (read > 0) {
+            remaining -= read;
+          }
+          return read;
+        }
+      };
+    }
+  }
+
+  class TestLogAppender extends AbstractAppender {
+    private final List<LogEvent> log = new ArrayList<>();
+
+    protected TestLogAppender() {
+      super(UUID.randomUUID().toString(), null, null, false, null);
+    }
+
+    @Override
+    public void append(LogEvent event) {
+      log.add(event);
+    }
+
+    public List<LogEvent> getLog() {
+      return new ArrayList<LogEvent>(log);
+    }
+  }
+}
+
+
