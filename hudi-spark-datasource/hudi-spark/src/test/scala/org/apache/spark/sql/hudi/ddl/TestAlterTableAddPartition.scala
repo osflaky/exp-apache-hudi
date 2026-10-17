@@ -1,0 +1,327 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.hudi.ddl
+
+import org.apache.spark.sql.hudi.common.HoodieSparkSqlTestBase
+import org.junit.jupiter.api.Assertions.{assertFalse, assertTrue}
+
+import java.io.File
+
+class TestAlterTableAddPartition extends HoodieSparkSqlTestBase {
+
+  test("Add partition for non-partitioned table") {
+    withTable(generateTableName) { tableName =>
+      // create table
+      spark.sql(
+        s"""
+           | create table $tableName (
+           |  id bigint,
+           |  name string,
+           |  ts string,
+           |  dt string
+           | )
+           | using hudi
+           | tblproperties (
+           |  primaryKey = 'id',
+           |  orderingFields = 'ts'
+           | )
+           |""".stripMargin)
+
+      checkExceptionContain(s"alter table $tableName add partition (dt='2023-08-01')")(
+        s"`$tableName` is a non-partitioned table that is not allowed to add partition")
+
+      // show partitions
+      checkAnswer(s"show partitions $tableName")(Seq.empty: _*)
+    }
+  }
+
+  test("Add partition with location") {
+    withTable(generateTableName){ tableName =>
+      // create table
+      spark.sql(
+        s"""
+           | create table $tableName (
+           |  id bigint,
+           |  name string,
+           |  ts string,
+           |  dt string
+           | )
+           | using hudi
+           | tblproperties (
+           |  primaryKey = 'id',
+           |  orderingFields = 'ts'
+           | )
+           | partitioned by (dt)
+           |""".stripMargin)
+
+      checkExceptionContain(s"alter table $tableName add partition (dt='2023-08-01') location '/tmp/path'")(
+        "Hoodie table does not support specify partition location explicitly")
+
+      // show partitions
+      checkAnswer(s"show partitions $tableName")(Seq.empty: _*)
+    }
+  }
+
+  test("Add partition if not exists") {
+    withTable(generateTableName){ tableName =>
+      // create table
+      spark.sql(
+        s"""
+           | create table $tableName (
+           |  id bigint,
+           |  name string,
+           |  ts string,
+           |  dt string
+           | )
+           | using hudi
+           | tblproperties (
+           |  primaryKey = 'id',
+           |  orderingFields = 'ts'
+           | )
+           | partitioned by (dt)
+           |""".stripMargin)
+
+      spark.sql(s"alter table $tableName add partition (dt='2023-08-01')")
+      // show partitions
+      checkAnswer(s"show partitions $tableName")(Seq("dt=2023-08-01"))
+
+      // no exception
+      spark.sql(s"alter table $tableName add if not exists partition (dt='2023-08-01')")
+
+      checkExceptionContain(s"alter table $tableName add partition (dt='2023-08-01')")(
+        "Partition metadata already exists for path")
+    }
+  }
+
+  Seq(false, true).foreach { hiveStyle =>
+    test(s"Add partition for single-partition table, isHiveStylePartitioning: $hiveStyle") {
+      withTable(generateTableName){ tableName =>
+        // create table
+        spark.sql(
+          s"""
+             | create table $tableName (
+             |  id bigint,
+             |  name string,
+             |  ts string,
+             |  dt string
+             | )
+             | using hudi
+             | tblproperties (
+             |  primaryKey = 'id',
+             |  orderingFields = 'ts',
+             |  hoodie.datasource.write.hive_style_partitioning = '$hiveStyle'
+             | )
+             | partitioned by (dt)
+             |""".stripMargin)
+
+        spark.sql(s"alter table $tableName add partition (dt='2023-08-01')")
+
+        // show partitions
+        checkAnswer(s"show partitions $tableName")(
+          if (hiveStyle) Seq("dt=2023-08-01") else Seq("2023-08-01")
+        )
+      }
+    }
+
+    test(s"Add partition for multi-level partitioned table, isHiveStylePartitioning: $hiveStyle") {
+      withTable(generateTableName){ tableName =>
+        // create table
+        spark.sql(
+          s"""
+             | create table $tableName (
+             |  id bigint,
+             |  name string,
+             |  ts string,
+             |  year string,
+             |  month string,
+             |  day string
+             | )
+             | using hudi
+             | tblproperties (
+             |  primaryKey = 'id',
+             |  orderingFields = 'ts',
+             |  hoodie.datasource.write.hive_style_partitioning = '$hiveStyle'
+             | )
+             | partitioned by (year, month, day)
+             |""".stripMargin)
+
+        spark.sql(s"alter table $tableName add partition (year='2023', month='08', day='01')")
+
+        // show partitions
+        checkAnswer(s"show partitions $tableName")(
+          if (hiveStyle) Seq("year=2023/month=08/day=01") else Seq("2023/08/01")
+        )
+      }
+    }
+  }
+
+  Seq(false, true).foreach { urlEncode =>
+    test(s"Add partition for single-partition table, urlEncode: $urlEncode") {
+      withTable(generateTableName){ tableName =>
+        // create table
+        spark.sql(
+          s"""
+             | create table $tableName (
+             |  id bigint,
+             |  name string,
+             |  ts string,
+             |  p_a string
+             | )
+             | using hudi
+             | tblproperties (
+             |  primaryKey = 'id',
+             |  orderingFields = 'ts',
+             |  hoodie.datasource.write.partitionpath.urlencode = '$urlEncode'
+             | )
+             | partitioned by (p_a)
+             |""".stripMargin)
+
+        spark.sql(s"alter table $tableName add partition (p_a='url%a')")
+
+        // show partitions
+        checkAnswer(s"show partitions $tableName")(
+          if (urlEncode) Seq("p_a=url%25a") else Seq("p_a=url%a")
+        )
+      }
+    }
+
+    test(s"Add partition for multi-level partitioned table, urlEncode: $urlEncode") {
+      withTable(generateTableName){ tableName =>
+        // create table
+        spark.sql(
+          s"""
+             | create table $tableName (
+             |  id bigint,
+             |  name string,
+             |  ts string,
+             |  p_a string,
+             |  p_b string
+             | )
+             | using hudi
+             | tblproperties (
+             |  primaryKey = 'id',
+             |  orderingFields = 'ts',
+             |  hoodie.datasource.write.partitionpath.urlencode = '$urlEncode'
+             | )
+             | partitioned by (p_a, p_b)
+             |""".stripMargin)
+
+        spark.sql(s"alter table $tableName add partition (p_a='url%a', p_b='key=val')")
+
+        // show partitions
+        checkAnswer(s"show partitions $tableName")(
+          if (urlEncode) Seq("p_a=url%25a/p_b=key%3Dval") else Seq("p_a=url%a/p_b=key=val")
+        )
+      }
+    }
+  }
+
+  test("Add partition for a slash separated date partitioned table") {
+    withTempDir { tmp =>
+      val tableName = generateTableName
+      val tablePath = s"${tmp.getCanonicalPath}/$tableName"
+      // create table
+      spark.sql(
+        s"""
+           | create table $tableName (
+           |  id bigint,
+           |  name string,
+           |  ts string,
+           |  dt string
+           | )
+           | using hudi
+           | tblproperties (
+           |  primaryKey = 'id',
+           |  orderingFields = 'ts',
+           |  hoodie.datasource.write.slash.separated.date.partitioning = 'true'
+           | )
+           | partitioned by (dt)
+           | location '$tablePath'
+           |""".stripMargin)
+
+      // The writer lays a partition value out as yyyy/MM/dd, so the DDL command has to name that
+      // very directory rather than the dashed value
+      spark.sql(s"""insert into $tableName values (1, "a1", "v1", "2026-01-05")""")
+
+      spark.sql(s"alter table $tableName add partition (dt='2026-02-06')")
+
+      assertTrue(new File(tablePath, "2026/02/06").exists(),
+        "ADD PARTITION should create the slash separated directory")
+      assertFalse(new File(tablePath, "2026-02-06").exists(),
+        "ADD PARTITION should not leave a dashed directory behind")
+
+      // naming the right directory also lets the existence check see the partition the writer created
+      spark.sql(s"alter table $tableName add if not exists partition (dt='2026-01-05')")
+      checkExceptionContain(s"alter table $tableName add partition (dt='2026-01-05')")(
+        "Partition metadata already exists for path")
+    }
+  }
+
+  test("Add partition leaves path breaking values alone under slash separated date partitioning") {
+    withTempDir { tmp =>
+      val tableName = generateTableName
+      val tablePath = s"${tmp.getCanonicalPath}/$tableName"
+      spark.sql(
+        s"""
+           | create table $tableName (
+           |  id bigint,
+           |  name string,
+           |  ts string,
+           |  dt string
+           | )
+           | using hudi
+           | tblproperties (
+           |  primaryKey = 'id',
+           |  orderingFields = 'ts',
+           |  hoodie.datasource.write.slash.separated.date.partitioning = 'true'
+           | )
+           | partitioned by (dt)
+           | location '$tablePath'
+           |""".stripMargin)
+
+      // NOTE: The writer refuses to slash these values -- see [[KeyGenUtils#hasPathBreakingDash]]
+      //       for what each one does to the path -- so the DDL command has to refuse them too, or
+      //       it creates a directory the writer would never have named
+      spark.sql(s"alter table $tableName add partition (dt='..-a')")
+      assertTrue(new File(tablePath, "..-a").exists(),
+        "ADD PARTITION should create the literal directory, not a dot segment")
+      // "../a" would resolve to a sibling of the table directory
+      assertFalse(new File(tmp.getCanonicalPath, "a").exists(),
+        "ADD PARTITION must not create a directory outside the table base path")
+
+      // "2026/" is normalized back to "2026" by StoragePath#normalize
+      spark.sql(s"alter table $tableName add partition (dt='2026-')")
+      assertTrue(new File(tablePath, "2026-").exists(),
+        "ADD PARTITION should keep a trailing dash")
+      assertFalse(new File(tablePath, "2026").exists(),
+        "ADD PARTITION should not drop a trailing dash by way of a trailing slash")
+
+      // "a//b" is collapsed to "a/b" by URI#normalize
+      spark.sql(s"alter table $tableName add partition (dt='a--b')")
+      assertTrue(new File(tablePath, "a--b").exists(),
+        "ADD PARTITION should keep a doubled dash")
+      assertFalse(new File(tablePath, "a").exists(),
+        "ADD PARTITION should not split a doubled dash into nested directories")
+
+      // a single interior dash is still a separator
+      spark.sql(s"alter table $tableName add partition (dt='2026-02-06')")
+      assertTrue(new File(tablePath, "2026/02/06").exists(),
+        "ADD PARTITION should still slash a well formed date")
+    }
+  }
+}

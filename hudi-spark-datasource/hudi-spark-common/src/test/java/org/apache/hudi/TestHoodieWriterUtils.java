@@ -1,0 +1,258 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.hudi;
+
+import org.apache.hudi.common.config.HoodieConfig;
+import org.apache.hudi.common.config.RecordMergeMode;
+import org.apache.hudi.common.config.TypedProperties;
+import org.apache.hudi.common.model.HoodieTableType;
+import org.apache.hudi.common.model.MetaFieldsMode;
+import org.apache.hudi.common.table.HoodieTableConfig;
+import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.HoodieTableVersion;
+import org.apache.hudi.config.HoodieWriteConfig;
+import org.apache.hudi.exception.HoodieException;
+import org.apache.hudi.testutils.HoodieClientTestBase;
+import org.apache.hudi.util.JavaScalaConverters;
+
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
+
+import java.io.IOException;
+import java.util.Properties;
+
+import static org.apache.hudi.common.testutils.HoodieTestUtils.getMetaClientBuilder;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class TestHoodieWriterUtils extends HoodieClientTestBase {
+
+  @Test
+  void validateTableConfig() throws IOException {
+    HoodieTableMetaClient tableMetaClient = getMetaClientBuilder(HoodieTableType.COPY_ON_WRITE, new Properties(), "")
+        .initTable(storageConf, tempDir.resolve("table1").toString());
+    HoodieTableConfig tableConfig = tableMetaClient.getTableConfig();
+    TypedProperties properties = TypedProperties.copy(tableConfig.getProps());
+    properties.put(HoodieTableConfig.DATABASE_NAME.key(), "databaseFromCatalog");
+    Assertions.assertDoesNotThrow(() -> HoodieWriterUtils.validateTableConfig(sparkSession, JavaScalaConverters.convertJavaPropertiesToScalaMap(properties), tableConfig));
+  }
+
+  @Test
+  void testReturnsKeyWhenTableConfigIsNull() {
+    assertEquals("randomKey", HoodieWriterUtils.getKeyInTableConfig("randomKey", null));
+  }
+
+  @Test
+  void validateTableConfigRejectsMultiFieldSlashPartitioningOnLegacyTable() throws IOException {
+    // A legacy table already holding slash-separated date partitioning with two partition fields:
+    // such a table can no longer be created through SQL or df.write, so the rejection has to fire
+    // off the table config alone, with the write providing no slash or partition configs of its own
+    Properties props = new Properties();
+    props.setProperty(HoodieTableConfig.PARTITION_FIELDS.key(), "datestr,city");
+    props.setProperty(HoodieTableConfig.SLASH_SEPARATED_DATE_PARTITIONING.key(), "true");
+    HoodieTableMetaClient tableMetaClient = getMetaClientBuilder(HoodieTableType.COPY_ON_WRITE, props, "")
+        .initTable(storageConf, tempDir.resolve("legacyMultiFieldSlashTable").toString());
+    HoodieTableConfig tableConfig = tableMetaClient.getTableConfig();
+
+    HoodieException ex = assertThrows(HoodieException.class,
+        () -> HoodieWriterUtils.validateTableConfig(
+            sparkSession, JavaScalaConverters.convertJavaPropertiesToScalaMap(new TypedProperties()), tableConfig));
+    assertTrue(ex.getMessage().contains("requires a single partition field"), ex.getMessage());
+  }
+
+  @Test
+  void validateTableConfigRejectsMultiFieldSlashPartitioningOnOverwrite() {
+    // SaveMode.Overwrite nulls the table config, so the rejection has to fire off the params
+    // alone, ahead of the isOverWriteMode gate that skips the rest of the validation
+    TypedProperties writeProps = new TypedProperties();
+    writeProps.put(HoodieTableConfig.SLASH_SEPARATED_DATE_PARTITIONING.key(), "true");
+    writeProps.put("hoodie.datasource.write.partitionpath.field", "datestr,city");
+
+    HoodieException ex = assertThrows(HoodieException.class,
+        () -> HoodieWriterUtils.validateTableConfig(
+            sparkSession, JavaScalaConverters.convertJavaPropertiesToScalaMap(writeProps), null, true));
+    assertTrue(ex.getMessage().contains("requires a single partition field"), ex.getMessage());
+  }
+
+  /**
+   * The meta-fields-mode guard compares normalized modes, not raw legacy property presence. A table
+   * written before {@code hoodie.meta.fields.mode} existed is normalized to ALL or NONE when its
+   * {@link HoodieTableConfig} is constructed, so a write that restates that same mode is asking for
+   * exactly what the table already is and must be accepted.
+   */
+  private void assertModeAgainstTable(String requestedMode, MetaFieldsMode tableMode,
+                                      String tableDir, boolean expectThrow) throws IOException {
+    Properties tableProps = new Properties();
+    // Start from a legacy boolean and verify table construction records the corresponding mode.
+    tableProps.put(HoodieTableConfig.POPULATE_META_FIELDS.key(),
+        String.valueOf(tableMode.toLegacyPopulateMetaFields()));
+    HoodieTableMetaClient metaClient = getMetaClientBuilder(HoodieTableType.COPY_ON_WRITE, tableProps, "")
+        .initTable(storageConf, tempDir.resolve(tableDir).toString());
+    HoodieTableConfig tableConfig = metaClient.getTableConfig();
+    assertEquals(tableMode, tableConfig.getMetaFieldsMode(),
+        "precondition: table construction must infer " + tableMode + " from the legacy boolean");
+    assertTrue(tableConfig.getProps().containsKey(HoodieTableConfig.META_FIELDS_MODE.key()),
+        "table construction must populate the authoritative mode property");
+
+    TypedProperties writeProps = TypedProperties.copy(tableConfig.getProps());
+    writeProps.put(HoodieTableConfig.META_FIELDS_MODE.key(), requestedMode);
+    Executable validate = () -> HoodieWriterUtils.validateTableConfig(
+        sparkSession, JavaScalaConverters.convertJavaPropertiesToScalaMap(writeProps), tableConfig);
+
+    if (expectThrow) {
+      HoodieException ex = assertThrows(HoodieException.class, validate);
+      assertTrue(ex.getMessage().contains(HoodieTableConfig.META_FIELDS_MODE.key()), ex.getMessage());
+    } else {
+      Assertions.assertDoesNotThrow(validate);
+    }
+  }
+
+  @Test
+  void validateTableConfigAcceptsAllModeRestatedOnALegacyTrueTable() throws IOException {
+    // mode=ALL against a table whose only meta-field property is populate.meta.fields=true.
+    assertModeAgainstTable("ALL", MetaFieldsMode.ALL, "metaModeAllRestated", false);
+  }
+
+  @Test
+  void validateTableConfigAcceptsNoneModeRestatedOnALegacyFalseTable() throws IOException {
+    // Mirror case: mode=NONE against populate.meta.fields=false.
+    assertModeAgainstTable("NONE", MetaFieldsMode.NONE, "metaModeNoneRestated", false);
+  }
+
+  @Test
+  void validateTableConfigRejectsSelectiveModeOnATableWithoutTheProperty() throws IOException {
+    // The case the guard exists for, and the one that must keep throwing: a table that resolves to
+    // NONE cannot be turned into COMMIT_TIME_ONLY by a write option, because the meta columns of
+    // every earlier commit are already physically absent.
+    assertModeAgainstTable("COMMIT_TIME_ONLY", MetaFieldsMode.NONE, "metaModeSelectiveOnNone", true);
+  }
+
+  @Test
+  void validateTableConfigRejectsNoneModeOnAnAllTable() throws IOException {
+    // Narrowing is still a disagreement here: hoodie.properties would keep advertising ALL while the
+    // writer stopped populating the columns.
+    assertModeAgainstTable("NONE", MetaFieldsMode.ALL, "metaModeNoneOnAll", true);
+  }
+
+  @Test
+  void testPayloadClassNameNotVersion9() {
+    HoodieConfig config = new HoodieConfig();
+    config.setValue(HoodieTableConfig.VERSION, "8");
+    String result = HoodieWriterUtils.getKeyInTableConfig(HoodieTableConfig.PAYLOAD_CLASS_NAME.key(), config);
+    assertEquals(HoodieTableConfig.PAYLOAD_CLASS_NAME.key(), result);
+  }
+
+  @Test
+  void testPayloadClassNameVersion9WithLegacyPayload() {
+    HoodieConfig config = new HoodieConfig();
+    config.setValue(HoodieTableConfig.VERSION, String.valueOf(HoodieTableVersion.NINE.versionCode()));
+    config.setValue(HoodieTableConfig.LEGACY_PAYLOAD_CLASS_NAME, "com.example.LegacyPayload");
+    String result = HoodieWriterUtils.getKeyInTableConfig(HoodieTableConfig.PAYLOAD_CLASS_NAME.key(), config);
+    assertEquals(HoodieTableConfig.LEGACY_PAYLOAD_CLASS_NAME.key(), result);
+  }
+
+  @Test
+  void testPayloadClassNameVersion9WithoutLegacyPayload() {
+    HoodieConfig config = new HoodieConfig();
+    config.setValue(HoodieTableConfig.VERSION, String.valueOf(HoodieTableVersion.NINE.versionCode()));
+    String result = HoodieWriterUtils.getKeyInTableConfig(HoodieTableConfig.PAYLOAD_CLASS_NAME.key(), config);
+    assertEquals(HoodieTableConfig.PAYLOAD_CLASS_NAME.key(), result);
+  }
+
+  @Test
+  void testRecordMergeModeMappingWithVersion9() {
+    HoodieConfig config = new HoodieConfig();
+    config.setValue(HoodieTableConfig.VERSION.key(), "9");
+    String result = HoodieWriterUtils.getKeyInTableConfig(HoodieWriteConfig.RECORD_MERGE_MODE.key(), config);
+    assertEquals(HoodieTableConfig.RECORD_MERGE_MODE.key(), result);
+  }
+
+  @Test
+  void testRecordMergeModeMappingWithVersion8() {
+    HoodieConfig config = new HoodieConfig();
+    config.setValue(HoodieTableConfig.VERSION.key(), "8");
+    String result = HoodieWriterUtils.getKeyInTableConfig(HoodieWriteConfig.RECORD_MERGE_MODE.key(), config);
+    assertEquals(HoodieWriteConfig.RECORD_MERGE_MODE.key(), result);
+  }
+
+  @Test
+  void testRecordMergeStrategyIdMappingWithVersion9() {
+    HoodieConfig config = new HoodieConfig();
+    config.setValue(HoodieTableConfig.VERSION.key(), "9");
+    String result = HoodieWriterUtils.getKeyInTableConfig(HoodieWriteConfig.RECORD_MERGE_STRATEGY_ID.key(), config);
+    assertEquals(HoodieTableConfig.RECORD_MERGE_STRATEGY_ID.key(), result);
+  }
+
+  @Test
+  void testRecordMergeStrategyIdMappingWithVersion8() {
+    HoodieConfig config = new HoodieConfig();
+    config.setValue(HoodieTableConfig.VERSION.key(), "8");
+    String result = HoodieWriterUtils.getKeyInTableConfig(HoodieWriteConfig.RECORD_MERGE_STRATEGY_ID.key(), config);
+    assertEquals(HoodieWriteConfig.RECORD_MERGE_STRATEGY_ID.key(), result);
+  }
+
+  @Test
+  void testFallbackToOriginalKey() {
+    HoodieConfig config = new HoodieConfig();
+    String result = HoodieWriterUtils.getKeyInTableConfig("my.custom.key", config);
+    assertEquals("my.custom.key", result);
+  }
+
+  @Test
+  void testShouldIgnorePayloadValidationVersion9WithCustomMergeMode() {
+    HoodieConfig config = new HoodieConfig();
+    config.setValue(HoodieTableConfig.VERSION, String.valueOf(HoodieTableVersion.NINE.versionCode()));
+    config.setValue(HoodieTableConfig.RECORD_MERGE_MODE, RecordMergeMode.CUSTOM.name());
+
+    String payloadClass = "com.example.CustomPayload";
+    assertFalse(HoodieWriterUtils.shouldIgnorePayloadValidation(payloadClass, config));
+  }
+
+  @Test
+  void testShouldIgnorePayloadValidationVersion9WithEmptyPayload() {
+    HoodieConfig config = new HoodieConfig();
+    config.setValue(HoodieTableConfig.VERSION, String.valueOf(HoodieTableVersion.NINE.versionCode()));
+    config.setValue(HoodieTableConfig.RECORD_MERGE_MODE, RecordMergeMode.COMMIT_TIME_ORDERING.name());
+
+    String payloadClass = "";
+    assertTrue(HoodieWriterUtils.shouldIgnorePayloadValidation(payloadClass, config));
+  }
+
+  @Test
+  void testShouldIgnorePayloadValidationVersion9WithCommitTimeOrdering() {
+    HoodieConfig config = new HoodieConfig();
+    config.setValue(HoodieTableConfig.VERSION, String.valueOf(HoodieTableVersion.NINE.versionCode()));
+    config.setValue(HoodieTableConfig.RECORD_MERGE_MODE, RecordMergeMode.COMMIT_TIME_ORDERING.name());
+
+    String payloadClass = "com.example.CustomPayload";
+    assertTrue(HoodieWriterUtils.shouldIgnorePayloadValidation(payloadClass, config));
+  }
+
+  @Test
+  void testShouldIgnorePayloadValidationVersion9WithEventTimeOrdering() {
+    HoodieConfig config = new HoodieConfig();
+    config.setValue(HoodieTableConfig.VERSION, String.valueOf(HoodieTableVersion.NINE.versionCode()));
+    config.setValue(HoodieTableConfig.RECORD_MERGE_MODE, RecordMergeMode.EVENT_TIME_ORDERING.name());
+
+    String payloadClass = "com.example.CustomPayload";
+    assertTrue(HoodieWriterUtils.shouldIgnorePayloadValidation(payloadClass, config));
+  }
+}
